@@ -1,0 +1,12 @@
+# binaries
+bittorrent-client
+*.exe
+
+# downloaded files (you don't want to commit these)
+*.iso
+*.mp4
+*.zip
+downloads/
+
+# Go
+*.test
