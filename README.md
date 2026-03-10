@@ -47,3 +47,13 @@ raw .torrent file bytes → Unmarshal → bencodeTorrent struct
 - Eight reserved bytes, all set to 0. We’d flip some of them to 1 to indicate that we support certain extensions. But we don’t, so we’ll keep them at 0.
 - The infohash that we calculated earlier to identify which file we want
 - The Peer ID that we made up to identify ourselves
+
+| ID  | Name       | Meaning                  |
+| --- | ---------- | ------------------------ |
+| 0   | Choke      | Peer won't send you data |
+| 1   | Unchoke    | Peer will send you data  |
+| 2   | Interested | You want data            |
+| 4   | Have       | Peer has a piece         |
+| 5   | Bitfield   | Which pieces peer has    |
+| 6   | Request    | Ask for a block          |
+| 7   | Piece      | Actual data              |
