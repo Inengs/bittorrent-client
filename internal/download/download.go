@@ -1,6 +1,7 @@
 package download
 
 import (
+	"crypto/sha1"
 	"encoding/binary"
 	"errors"
 	"net"
@@ -23,7 +24,7 @@ type PieceResult struct {
 	Data  []byte
 }
 
-const BlockSize = 16834 // 16KB in bytes
+const BlockSize = 16384 // 16KB in bytes
 
 func Download(t torrent.TorrentFile, peers []peer.Peer, peerID [20]byte) ([]byte, error) {
 	pieceWork := make(chan PieceWork, len(t.PieceHashes))
@@ -105,6 +106,13 @@ func downloadFromPeer(p peer.Peer, peerID [20]byte, infoHash [20]byte, pw chan P
 			continue
 		}
 
+		// verify the hash
+		hash := sha1.Sum(data)
+		if hash != work.Hash {
+			pw <- work // hash mismatch, requeue
+			continue
+		}
+
 		pR <- PieceResult{Index: work.Index, Data: data}
 	}
 
@@ -133,6 +141,33 @@ func downloadPiece(conn net.Conn, work PieceWork) ([]byte, error) {
 		binary.BigEndian.PutUint32(payload[4:8], uint32(begin))
 		binary.BigEndian.PutUint32(payload[8:12], uint32(requestLength))
 
+		// send the request message
+		msg := &peer.Message{
+			ID: peer.MsgRequest,
+			Payload: payload,
+		}
+
+		_, err := conn.Write(msg.Serialize())
+		if err != nil {
+			return nil, err
+		}
+
+		// read the piece message back
+		pieceMsg, err := peer.ReadMessage(conn)
+		if err != nil {
+			return nil, err
+		}
+
+		if pieceMsg.ID != peer.MsgPiece {
+			return nil, errors.New("expected piece message")
+		}
+
+		// parse the piece message payload
+		// payload format: 4 bytes index + 4 bytes begin + rest is data
+		blockData := pieceMsg.Payload[8:]
+
+		// copy block data into correct position in buffer
+		copy(buffer[begin:], blockData)
 	}
 
 	return buffer, nil
