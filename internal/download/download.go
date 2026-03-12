@@ -4,6 +4,7 @@ import (
 	"crypto/sha1"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
 
 	"github.com/Inengs/bittorrent-client/internal/bitfield"
@@ -42,7 +43,10 @@ func Download(t torrent.TorrentFile, peers []peer.Peer, peerID [20]byte) ([]byte
     // launch a goroutine per peer
     for _, p := range peers {
         go func(p peer.Peer) {
-            downloadFromPeer(p, peerID, t.InfoHash, pieceWork, pieceResult)
+            err := downloadFromPeer(p, peerID, t.InfoHash, t, pieceWork, pieceResult)
+			if err != nil {
+            	fmt.Printf("peer %s failed: %v\n", p.IP, err)
+        	}
         }(p)
     }
 
@@ -60,9 +64,10 @@ func Download(t torrent.TorrentFile, peers []peer.Peer, peerID [20]byte) ([]byte
 	return buf, nil
 }
 
-func downloadFromPeer(p peer.Peer, peerID [20]byte, infoHash [20]byte, pw chan PieceWork, pR chan PieceResult) error{
+func downloadFromPeer(p peer.Peer, peerID [20]byte, infoHash [20]byte, t torrent.TorrentFile, pw chan PieceWork, pR chan PieceResult) error{
 	conn, err := peer.Connect(p, infoHash, peerID)
 	if err != nil {
+		fmt.Printf("failed to connect to peer %s: %v\n", p.IP, err)
 		return err
 	}
 	defer conn.Close()
@@ -70,27 +75,50 @@ func downloadFromPeer(p peer.Peer, peerID [20]byte, infoHash [20]byte, pw chan P
 	// peer immediately sends bitfield after handshake
 	msg, err := peer.ReadMessage(conn)
 	if err != nil {
+		fmt.Printf("failed to read bitfield: %v\n", err)
 		return err
 	}
 
-	if msg.ID != peer.MsgBitfield {
-		return errors.New("expected bitfield message")
+	var bf bitfield.Bitfield
+	switch msg.ID {
+	case peer.MsgBitfield:
+		fmt.Println("got bitfield")
+		bf = bitfield.Bitfield(msg.Payload)
+	case peer.MsgUnchoke:
+		fmt.Println("peer sent unchoke instead of bitfield, assuming all pieces available")
+		bf = make(bitfield.Bitfield, len(t.PieceHashes)/8+1)
+		for i := range bf {
+			bf[i] = 0xff
+		}
+	default:
+		return fmt.Errorf("unexpected message ID: %d", msg.ID)
 	}
 
-	bf := bitfield.Bitfield(msg.Payload)
+	fmt.Println("got bitfield")
+
+	// bf := bitfield.Bitfield(msg.Payload)
 
 	// send interested
     conn.Write((&peer.Message{ID: peer.MsgInterested}).Serialize())
+	fmt.Println("sent interested")
 
  	// wait for unchoke
     for {
         msg, err := peer.ReadMessage(conn)
         if err != nil {
+			fmt.Printf("failed waiting for unchoke: %v\n", err)
             return err
         }
         if msg.ID == peer.MsgUnchoke {
+			fmt.Println("got unchoke")
             break
         }
+
+		// ignore have messages while waiting, which means i just finished downloading a piece
+		if msg.ID == peer.MsgHave {
+			continue
+		}
+		fmt.Printf("waiting for unchoke, got message ID: %d\n", msg.ID)
     }
 
 	// download loop

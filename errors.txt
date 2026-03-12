@@ -1,0 +1,9 @@
+Bug: Peer sent MsgUnchoke (ID=1) instead of MsgBitfield (ID=5) as first message.
+
+Some peers skip the bitfield message entirely if they have all pieces and go
+straight to unchoke. The fix was to check the first message ID and if it's
+an unchoke, assume the peer has all pieces and create a full bitfield with
+all bits set to 1 (0xff per byte).
+
+Lesson: BitTorrent peers don't always follow the expected message order.
+Always handle optional messages gracefully.

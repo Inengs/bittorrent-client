@@ -33,12 +33,15 @@ func main() {
 		log.Fatal(err)
 	}
 
+
 	// convert to TorrentFile
 	torrentFile, err := torrent.ToTorrentFile(*bencodeTorrent)
 	if err != nil {
 		log.Fatal(err)
 	}
 
+	fmt.Println("tracker:", torrentFile.Announce)
+	
 	// generate peerID
 	var peerID [20]byte
 	_, err = rand.Read(peerID[:])
@@ -52,6 +55,11 @@ func main() {
 		log.Fatal(err)
 	}
 	fmt.Printf("found %d peers\n", len(peers))
+
+	fmt.Printf("found %d peers\n", len(peers))
+	for _, p := range peers {
+    	fmt.Printf("  %s:%d\n", p.IP, p.Port)
+	}
 
 	// download
 	data, err := download.Download(torrentFile, peers, peerID)

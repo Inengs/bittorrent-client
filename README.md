@@ -2,6 +2,8 @@
 
 This is learning project, where i build a bittorrent taking the lead from Jesse Li's Building a BitTorrent client from the ground up in Go
 
+Built this to learn how backend systems work at a low level. Implements bencode parsing, tracker communication over HTTP, TCP peer connections, the BitTorrent handshake, and concurrent piece downloading using goroutines and channels.
+
 ### Bencode
 
 Bencode (short for binary encoding) is a very simple data serialization format used mainly by the BitTorrent protocol.

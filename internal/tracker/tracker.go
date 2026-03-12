@@ -34,7 +34,7 @@ func buildTrackerURL(torrentFile torrent.TorrentFile, peerID [20]byte) (string, 
 	params.Set("downloaded", "0")
 	params.Set("compact", "1")
 	params.Set("left", strconv.Itoa(torrentFile.Length))
-	
+	params.Set("numwant", "50") // ask for up to 50 peers
 
 	base.RawQuery = params.Encode()
 
