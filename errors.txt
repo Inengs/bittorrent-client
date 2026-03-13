@@ -7,3 +7,9 @@ all bits set to 1 (0xff per byte).
 
 Lesson: BitTorrent peers don't always follow the expected message order.
 Always handle optional messages gracefully.
+
+
+When connecting to a peer, the BitTorrent protocol expects the peer to send a Bitfield message first — telling you which pieces they have. 
+But when I tested against a real peer, it sent an Unchoke message (ID=1) instead of a Bitfield (ID=5) and my client crashed. 
+Turns out some peers skip the Bitfield entirely if they have all pieces and go straight to Unchoke — implying "I have everything, just ask me." 
+The fix was to detect this case and create a full bitfield with all bits set to 1 (0xff), assuming the peer is a full seeder.
