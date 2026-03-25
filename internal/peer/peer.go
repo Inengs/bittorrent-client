@@ -72,6 +72,10 @@ func ReadMessage(r io.Reader) (*Message, error) {
 
 	length := binary.BigEndian.Uint32(lengthBuffer)
 
+	if length == 0 {
+        return &Message{ID: 0, Payload: nil}, nil // keep-alive, treat as ID 0 or special case
+    }
+	
 	// read message ID
 	messageIDBuffer := make([]byte, 1)
 	_, err = io.ReadFull(r, messageIDBuffer)

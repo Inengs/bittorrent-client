@@ -28,23 +28,28 @@ type PieceResult struct {
 const BlockSize = 16384 // 16KB in bytes
 
 func Download(t torrent.TorrentFile, peers []peer.Peer, peerID [20]byte) ([]byte, error) {
+	if len(peers) == 0 {
+		return nil, errors.New("no peers available")
+	}
+
+	fmt.Printf("Starting download with %d peers (max 5 concurrent)\n", len(peers))
+	
 	pieceWork := make(chan PieceWork, len(t.PieceHashes))
-	pieceResult := make(chan PieceResult)
+	pieceResult := make(chan PieceResult, len(t.PieceHashes)) // buffered
 
-    // queue up all pieces
-    for i, hash := range t.PieceHashes {
-		begin := i * t.PieceLength
-		end := begin + t.PieceLength
-		if end > t.Length {
-			end = t.Length
+	// Queue all pieces
+	for i, hash := range t.PieceHashes {
+		length := t.PieceLength
+		if i == len(t.PieceHashes)-1 {
+			length = t.Length % t.PieceLength
+			if length == 0 {
+				length = t.PieceLength
+			}
 		}
+		pieceWork <- PieceWork{Index: i, Hash: hash, Length: length}
+	}
 
-        pieceWork <- PieceWork{
-            Index:  i,
-            Hash:   hash,
-            Length: end - begin,
-        }
-    }
+	close(pieceWork)   // ← CRITICAL: close it immediately after queuing
 
     // launch a goroutine per peer
     for _, p := range peers {
@@ -59,14 +64,15 @@ func Download(t torrent.TorrentFile, peers []peer.Peer, peerID [20]byte) ([]byte
 	// collect from Peers
 	buf := make([]byte, t.Length)
 	donePieces := 0
+
 	for donePieces < len(t.PieceHashes) {
 		result := <- pieceResult
 		begin := result.Index * t.PieceLength
 		copy(buf[begin:], result.Data)
 		donePieces++
+		fmt.Printf("✓ Piece %d/%d downloaded\n", donePieces, len(t.PieceHashes))
 	}
 
-	close(pieceWork)
 	return buf, nil
 }
 
@@ -126,20 +132,22 @@ func runPeerSession(conn net.Conn, t torrent.TorrentFile, pw chan PieceWork, pR 
 	// download loop
 	for work := range pw {
 		if !bf.HasPiece(work.Index) {
-			pw <- work // put back we dont have it 
+			// pw <- work // put back we dont have it 
 			continue
 		}
 
 		data, err := downloadPiece(conn, work)
 		if err != nil {
-			pw <- work // put back on failure
+			fmt.Printf("Failed to download piece %d: %v\n", work.Index, err)
+			// pw <- work // put back on failure
 			continue
 		}
 
 		// verify the hash
 		hash := sha1.Sum(data)
 		if hash != work.Hash {
-			pw <- work // hash mismatch, requeue
+			fmt.Printf("Hash mismatch on piece %d\n", work.Index)
+			// pw <- work // hash mismatch, requeue
 			continue
 		}
 
@@ -164,12 +172,12 @@ func downloadFromPeer(p peer.Peer, peerID [20]byte, infoHash [20]byte, t torrent
 func downloadPiece(conn net.Conn, work PieceWork) ([]byte, error) {
 	buffer := make([]byte, work.Length) // create an empty buffer the exact size of the piece
 
-	for i := 0; i < work.Length; i += BlockSize {
-		begin := i // starting byte position within the piece 0, 16384, 32768
+	for offset := 0; offset < work.Length; offset += BlockSize {
+		// begin := i // starting byte position within the piece 0, 16384, 32768
 		requestLength := BlockSize // assuming we want a full 16kb block 
 
-		remainingBytes := work.Length - begin
-		weAreRequestingTooMuch := (begin + requestLength) > work.Length
+		remainingBytes := work.Length - offset
+		weAreRequestingTooMuch := (offset + requestLength) > work.Length
 
 		if weAreRequestingTooMuch {
 			requestLength = remainingBytes
@@ -180,7 +188,7 @@ func downloadPiece(conn net.Conn, work PieceWork) ([]byte, error) {
 		// build and send the request
 		payload := make([]byte, 12) // 3 fields * 4 bytes each
 		binary.BigEndian.PutUint32(payload[0:4], uint32(pieceIndex)) // put index as first 4 bytes 
-		binary.BigEndian.PutUint32(payload[4:8], uint32(begin))
+		binary.BigEndian.PutUint32(payload[4:8], uint32(offset))
 		binary.BigEndian.PutUint32(payload[8:12], uint32(requestLength))
 
 		// send the request message
@@ -194,42 +202,31 @@ func downloadPiece(conn net.Conn, work PieceWork) ([]byte, error) {
 			return nil, err
 		}
 
-		// read the piece message back
-		pieceMsg, err := peer.ReadMessage(conn)
-		if err != nil {
-			return nil, err
+		// Read until we get the piece we want
+		for {
+			msg, err := peer.ReadMessage(conn)
+			if err != nil {
+				return nil, err
+			}
+			if msg.ID == peer.MsgPiece {
+				if len(msg.Payload) < 8 {
+					continue
+				}
+				index := int(binary.BigEndian.Uint32(msg.Payload[0:4]))
+				begin := int(binary.BigEndian.Uint32(msg.Payload[4:8]))
+				block := msg.Payload[8:]
+
+				// Check if this is the block we asked for
+				if index == work.Index && begin == offset {
+					copy(buffer[begin:], block)
+					break // got what we wanted, move to next block
+				}
+			} else if msg.ID == peer.MsgChoke {
+				return nil, errors.New("peer choked us")
+			} else if msg.ID != 0 {
+				fmt.Printf("Ignored message ID %d\n", msg.ID)
+			}
 		}
-
-		if pieceMsg.ID != peer.MsgPiece {
-			return nil, errors.New("expected piece message")
-		}
-
-		if len(pieceMsg.Payload) < 8 {
-			return nil, errors.New("invalid piece payload")
-		}
-
-		// parse the piece message payload
-		// payload format: 4 bytes index + 4 bytes begin + rest is data
-		index := int(binary.BigEndian.Uint32(pieceMsg.Payload[0:4]))
-		beginResp := int(binary.BigEndian.Uint32(pieceMsg.Payload[4:8]))
-		blockData := pieceMsg.Payload[8:]
-
-		if index != work.Index {
-			return nil, fmt.Errorf("unexpected piece index %d", index)
-		}
-
-		if beginResp != begin {
-			return nil, fmt.Errorf("unexpected begin offset %d", beginResp)
-		}
-
-		if beginResp+len(blockData) > len(buffer) {
-			return nil, errors.New("block exceeds piece size")
-		}
-
-
-		// copy block data into correct position in buffer
-		copy(buffer[beginResp:], blockData)
 	}
-
 	return buffer, nil
 }
