@@ -36,9 +36,9 @@ func (m *mockConn) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
-func (m *mockConn) Close() error { 
+func (m *mockConn) Close() error {
 	// does nothing, real connections must be closed
-	return nil 
+	return nil
 }
 
 func (m *mockConn) LocalAddr() net.Addr { return nil } // real connections have a local address, we just returned nil sha.
@@ -96,13 +96,11 @@ func Test_DownloadPiece_SingleBlock(t *testing.T) {
 
 	copy(payload[8:], data) // this places the data after the first 8 bytes into the data section
 
-
 	msg := peer.Message{
 		// This simulates the message sent by a peer
 		ID:      peer.MsgPiece,
 		Payload: payload,
 	}
-
 
 	msg.Serialize() // this converts the message into raw bytes for network transmission
 
@@ -110,7 +108,7 @@ func Test_DownloadPiece_SingleBlock(t *testing.T) {
 		// this simulates a peer connection
 		readBuffer: msg.Serialize(),
 	}
-	
+
 	result, err := downloadPiece(conn, work) // the process then runs
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -201,149 +199,6 @@ func TestDownloadPiece_WriteError(t *testing.T) {
 	}
 }
 
-func TestDownloadFromPeer_HashMatch(t *testing.T) {
-	data := make([]byte, 1000)
-
-	work := PieceWork{
-		Index: 0,
-		Length: 1000,
-		Hash: sha1.Sum(data),
-	}
-
-	pw := make(chan PieceWork, 1)
-	pR := make(chan PieceResult, 1)
-
-	pw <- work
-	close(pw)
-
-	 // Build what the "peer" sends: bitfield + unchoke + piece data
-    bf := peer.Message{ID: peer.MsgBitfield, Payload: []byte{0xff}}
-    unchoke := peer.Message{ID: peer.MsgUnchoke}
-    piece := buildPieceMessage(0, 0, data)
-
-    var buf []byte
-    buf = append(buf, bf.Serialize()...)
-    buf = append(buf, unchoke.Serialize()...)
-    buf = append(buf, piece...)
-
-    conn := &mockConn{readBuffer: buf}
-
-    err := runPeerSession(conn, fakeTorrent, pw, pR)
-    // err is expected (channel closed), check result
-	if err != nil {
-    	t.Fatalf("runPeerSession returned error: %v", err)
-	}
-
-    select {
-    case result := <-pR:
-        if len(result.Data) != 1000 {
-            t.Fatalf("wrong data length: %d", len(result.Data))
-        }
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for piece result")
-	}
-}
-
-
-// Peer sends unchoke as first message (no bitfield) — tests alreadyUnchoked path
-func TestRunPeerSession_UnchokeFirst(t *testing.T) {
-    data := make([]byte, 1000)
-    pw := make(chan PieceWork, 1)
-    pR := make(chan PieceResult, 1)
-    pw <- PieceWork{Index: 0, Length: 1000, Hash: sha1.Sum(data)}
-    close(pw)
-
-    unchoke := peer.Message{ID: peer.MsgUnchoke}
-    piece := buildPieceMessage(0, 0, data)
-
-    var buf []byte
-    buf = append(buf, unchoke.Serialize()...)
-    buf = append(buf, piece...)
-
-    conn := &mockConn{readBuffer: buf}
-    err := runPeerSession(conn, fakeTorrent, pw, pR)
-    if err != nil {
-        t.Fatalf("unexpected error: %v", err)
-    }
-
-    select {
-    case result := <-pR:
-        if len(result.Data) != 1000 {
-            t.Fatalf("wrong data length: %d", len(result.Data))
-        }
-    case <-time.After(time.Second):
-        t.Fatal("timed out")
-    }
-}
-
-// Peer sends an unexpected first message — should return error
-func TestRunPeerSession_UnexpectedFirstMessage(t *testing.T) {
-    pw := make(chan PieceWork, 1)
-    pR := make(chan PieceResult, 1)
-    close(pw)
-
-    msg := peer.Message{ID: peer.MsgChoke}
-    conn := &mockConn{readBuffer: msg.Serialize()}
-
-    err := runPeerSession(conn, fakeTorrent, pw, pR)
-    if err == nil {
-        t.Fatal("expected error for unexpected first message")
-    }
-}
-
-// Hash mismatch — piece should NOT appear in results
-func TestRunPeerSession_HashMismatch(t *testing.T) {
-    data := make([]byte, 1000)
-    badHash := [20]byte{0xff} // wrong hash
-
-    pw := make(chan PieceWork, 2) // buffer=2 so requeue doesn't block
-    pR := make(chan PieceResult, 1)
-    pw <- PieceWork{Index: 0, Length: 1000, Hash: badHash}
-    close(pw)
-
-    bf := peer.Message{ID: peer.MsgBitfield, Payload: []byte{0xff}}
-    unchoke := peer.Message{ID: peer.MsgUnchoke}
-    piece := buildPieceMessage(0, 0, data)
-
-    var buf []byte
-    buf = append(buf, bf.Serialize()...)
-    buf = append(buf, unchoke.Serialize()...)
-    buf = append(buf, piece...)
-
-    conn := &mockConn{readBuffer: buf}
-    runPeerSession(conn, fakeTorrent, pw, pR)
-
-    select {
-    case <-pR:
-        t.Fatal("should not have received result with bad hash")
-    default:
-        // correct — nothing sent
-    }
-}
-
-// Peer doesn't have the piece (bitfield says 0) — work requeued, nothing downloaded
-func TestRunPeerSession_PeerMissingPiece(t *testing.T) {
-    pw := make(chan PieceWork, 2)
-    pR := make(chan PieceResult, 1)
-    pw <- PieceWork{Index: 0, Length: 1000, Hash: sha1.Sum(make([]byte, 1000))}
-    close(pw)
-
-    bf := peer.Message{ID: peer.MsgBitfield, Payload: []byte{0x00}} // no pieces
-    unchoke := peer.Message{ID: peer.MsgUnchoke}
-
-    var buf []byte
-    buf = append(buf, bf.Serialize()...)
-    buf = append(buf, unchoke.Serialize()...)
-
-    conn := &mockConn{readBuffer: buf}
-    runPeerSession(conn, fakeTorrent, pw, pR)
-
-    select {
-    case <-pR:
-        t.Fatal("should not have received result when peer lacks piece")
-    default:
-    }
-}
 
 // Wrong piece index in response
 func TestDownloadPiece_WrongIndex(t *testing.T) {

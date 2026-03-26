@@ -6,38 +6,40 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync"
 
-	"github.com/Inengs/bittorrent-client/internal/bitfield"
 	"github.com/Inengs/bittorrent-client/internal/peer"
 	"github.com/Inengs/bittorrent-client/internal/torrent"
 )
 
-// this represents a piece to download
+const BlockSize = 16384 // 16KB
+
+// PieceWork = one piece we need to download
 type PieceWork struct {
 	Index  int
 	Hash   [20]byte
 	Length int
 }
 
-// represents a completed downloaded piece
+// PieceResult = successfully downloaded and verified piece
 type PieceResult struct {
 	Index int
 	Data  []byte
 }
 
-const BlockSize = 16384 // 16KB in bytes
-
+// Download is the main function you call from main.go
 func Download(t torrent.TorrentFile, peers []peer.Peer, peerID [20]byte) ([]byte, error) {
 	if len(peers) == 0 {
 		return nil, errors.New("no peers available")
 	}
 
-	fmt.Printf("Starting download with %d peers (max 5 concurrent)\n", len(peers))
-	
-	pieceWork := make(chan PieceWork, len(t.PieceHashes))
-	pieceResult := make(chan PieceResult, len(t.PieceHashes)) // buffered
+	fmt.Printf("Starting download using %d peers...\n", len(peers))
 
-	// Queue all pieces
+	// these are buffered channels, it has a queue, the sender can keep pushing until the queue is full (the number of pieces is the size of the queue)- this is to avoid deadlock
+	workChannel := make(chan PieceWork, len(t.PieceHashes))
+	resultChannel := make(chan PieceResult, len(t.PieceHashes))
+
+	// put all the pieces into the work queue
 	for i, hash := range t.PieceHashes {
 		length := t.PieceLength
 		if i == len(t.PieceHashes)-1 {
@@ -46,187 +48,195 @@ func Download(t torrent.TorrentFile, peers []peer.Peer, peerID [20]byte) ([]byte
 				length = t.PieceLength
 			}
 		}
-		pieceWork <- PieceWork{Index: i, Hash: hash, Length: length}
+
+		workChannel <- PieceWork{Index: i, Hash: hash, Length: length}
+	}
+	close(workChannel) // signals the worker that no more work is coming
+
+	// Start worker goroutines (limited to max 5 concurrent peers)
+	var wg sync.WaitGroup
+	maxWorkers := 5
+	if len(peers) < maxWorkers {
+		maxWorkers = len(peers) // if the last remaining peers is less than 5, just start them
 	}
 
-	close(pieceWork)   // ← CRITICAL: close it immediately after queuing
-
-    // launch a goroutine per peer
-    for _, p := range peers {
-        go func(p peer.Peer) {
-            err := downloadFromPeer(p, peerID, t.InfoHash, t, pieceWork, pieceResult)
-			if err != nil {
-            	fmt.Printf("peer %s failed: %v\n", p.IP, err)
-        	}
-        }(p)
-    }
-
-	// collect from Peers
-	buf := make([]byte, t.Length)
-	donePieces := 0
-
-	for donePieces < len(t.PieceHashes) {
-		result := <- pieceResult
-		begin := result.Index * t.PieceLength
-		copy(buf[begin:], result.Data)
-		donePieces++
-		fmt.Printf("✓ Piece %d/%d downloaded\n", donePieces, len(t.PieceHashes))
+	// each worker runs as a goroutine
+	for i := 0; i < maxWorkers; i++ {
+		wg.Add(1) // registers the worker
+		go func(workerID int) {
+			defer wg.Done() // marks complete when it returns
+			worker(t, peers, peerID, workChannel, resultChannel, workerID)
+		}(i)
 	}
 
-	return buf, nil
+	// collect all results
+	fileData := make([]byte, t.Length)
+	recieved := 0
+
+	for recieved < len(t.PieceHashes) {
+		result := <-resultChannel
+		start := result.Index * t.PieceLength
+		copy(fileData[start:], result.Data)
+		recieved++
+		fmt.Printf("✓ Piece %d/%d completed\n", recieved, len(t.PieceHashes))
+	}
+
+	wg.Wait() // wait for all workers to finish
+	return fileData, nil
 }
 
-func runPeerSession(conn net.Conn, t torrent.TorrentFile, pw chan PieceWork, pR chan PieceResult) error {
-	// peer immediately sends bitfield after handshake
-	msg, err := peer.ReadMessage(conn)
-	if err != nil {
-		fmt.Printf("failed to read bitfield: %v\n", err)
-		return err
-	}
+func worker(t torrent.TorrentFile, peers []peer.Peer, peerID [20]byte, workChannel <-chan PieceWork, resultChannel chan<- PieceResult, id int) {
+	// workChannel - read-only channel(pulls piece jobs from), resultChannel - write only channel(send completed pieces from), id - work identifier for logging
 
-	var bf bitfield.Bitfield
-	var alreadyUnchoked bool
-	switch msg.ID {
-	case peer.MsgBitfield:
-		fmt.Println("got bitfield")
-		bf = bitfield.Bitfield(msg.Payload)
-	case peer.MsgUnchoke:
-		fmt.Println("peer sent unchoke instead of bitfield, assuming all pieces available")
-		bf = make(bitfield.Bitfield, len(t.PieceHashes)/8+1)
-		for i := range bf {
-			bf[i] = 0xff
-		}
-		alreadyUnchoked = true
-	default:
-		return fmt.Errorf("unexpected message ID: %d", msg.ID)
-	}
+	// pull work from Channel
+	for work := range workChannel {
+		success := false
 
-	fmt.Println("got bitfield")
-
-	// bf := bitfield.Bitfield(msg.Payload)
-
-	// send interested
-    conn.Write((&peer.Message{ID: peer.MsgInterested}).Serialize())
-	fmt.Println("sent interested")
-
-	if !alreadyUnchoked {	
-		// wait for unchoke
-		for {
-			msg, err := peer.ReadMessage(conn)
-			if err != nil {
-				fmt.Printf("failed waiting for unchoke: %v\n", err)
-				return err
-			}
-			if msg.ID == peer.MsgUnchoke {
-				fmt.Println("got unchoke")
+		// try different peers until one succeeds
+		for _, p := range peers {
+			err := downloadFromPeer(p, peerID, t, work, resultChannel)
+			if err == nil {
+				success = true
 				break
 			}
 
-			// ignore have messages while waiting, which means i just finished downloading a piece
-			if msg.ID == peer.MsgHave {
-				continue
-			}
-			fmt.Printf("waiting for unchoke, got message ID: %d\n", msg.ID)
+			fmt.Printf("Worker %d: peer %s failed piece %d: %v\n", id, p.IP, work.Index, err)
+		}
+
+		if !success {
+			// If all peers fail, we can re-queue or fail. For now we just skip (you can improve later)
+			fmt.Printf("Failed to download piece %d from any peer\n", work.Index)
 		}
 	}
-	// download loop
-	for work := range pw {
-		if !bf.HasPiece(work.Index) {
-			// pw <- work // put back we dont have it 
-			continue
-		}
-
-		data, err := downloadPiece(conn, work)
-		if err != nil {
-			fmt.Printf("Failed to download piece %d: %v\n", work.Index, err)
-			// pw <- work // put back on failure
-			continue
-		}
-
-		// verify the hash
-		hash := sha1.Sum(data)
-		if hash != work.Hash {
-			fmt.Printf("Hash mismatch on piece %d\n", work.Index)
-			// pw <- work // hash mismatch, requeue
-			continue
-		}
-
-		pR <- PieceResult{Index: work.Index, Data: data}
+}
+// downloadFromPeer connects, does handshake, and tries to download one piece
+func downloadFromPeer(p peer.Peer, peerID [20]byte, t torrent.TorrentFile, work PieceWork, resultChannel chan<- PieceResult) error {
+	// Takes the peer to connect to, your own peer ID, the torrent metadata, the piece to download, and a write-only channel to send the result back on once done.
+	
+	// Opens a TCP connection to the peer and performs the initial BitTorrent handshake — exchanging InfoHash and peer IDs to confirm you're both talking about the same torrent.
+	conn, err := peer.Connect(p, t.InfoHash, peerID)
+	if err != nil {
+		return nil
 	}
 
+	defer conn.Close() // Ensures the TCP connection is always closed when this function returns
+
+	// simple Handshake flow
+	if err := doHandshakeFlow(conn); err != nil {
+    	return err
+	}
+
+	// download one piece
+	data, err := downloadPiece(conn, work)
+	if err != nil {
+		return err
+	}
+
+	// verify Hash,  After downloading, you hash the data you received and compare it against the expected hash. If they don't match, the data is corrupted or the peer sent you bad data
+	if sha1.Sum(data) != work.Hash {
+		return errors.New("hash mismatch")
+	}
+
+	resultChannel <- PieceResult{Index: work.Index, Data: data} // push the verified piece into the results channel if everything works out, this is a write channel btw
 	return nil
 }
 
-func downloadFromPeer(p peer.Peer, peerID [20]byte, infoHash [20]byte, t torrent.TorrentFile, pw chan PieceWork, pR chan PieceResult) error{
-	conn, err := peer.Connect(p, infoHash, peerID)
+// do the interested + unchoke part
+func doHandshakeFlow(conn net.Conn) error {
+	// takes the TCP connection and the torrent metadata and returns an error
+
+	// Read first message (bitfield or unchoke)
+	msg, err := peer.ReadMessage(conn)
 	if err != nil {
-		fmt.Printf("failed to connect to peer %s: %v\n", p.IP, err)
+		return fmt.Errorf("failed to read first message: %w", err)
+	}
+
+	switch msg.ID {
+	case peer.MsgBitfield:
+		fmt.Println("Received bitfield") // means we have it complete
+	case peer.MsgUnchoke:
+		fmt.Println("Peer sent unchoke immediately (seed behavior)") // sometimes it just sends unchoke immediately
+	default:
+		fmt.Printf("Received unexpected message ID: %d after handshake\n", msg.ID)
+	}
+
+	// send interested, so the peer can unchoke me
+	_, err = conn.Write((&peer.Message{ID: peer.MsgInterested}).Serialize())
+	if err != nil {
 		return err
 	}
-	defer conn.Close()
 
-	return runPeerSession(conn, t, pw, pR)
+	// Wait for unchoke
+	for {
+		msg, err = peer.ReadMessage(conn)
+		if err != nil {
+			return err
+		}
+
+		if msg.ID == peer.MsgUnchoke {
+			fmt.Println("Received unchoke - ready to download")
+			return nil
+		}
+
+		// Ignore keep-alives and other messages (like Have)
+		if msg.ID != 0 {
+			fmt.Printf("Ignored message ID %d while waiting for unchoke\n", msg.ID)
+		}
+	}
 }
 
-// this function sends a request to the peer, waits for a piece message, extracts the data block, stores it in a buffer, returns the full piece
 func downloadPiece(conn net.Conn, work PieceWork) ([]byte, error) {
-	buffer := make([]byte, work.Length) // create an empty buffer the exact size of the piece
+	// connects via TCP to a peer and a PieceWork(this carries the piece index, length and hash), it then returns the raw bytes or an error
+	data := make([]byte, work.Length) // create a buffer to store the downloaded block
 
 	for offset := 0; offset < work.Length; offset += BlockSize {
-		// begin := i // starting byte position within the piece 0, 16384, 32768
-		requestLength := BlockSize // assuming we want a full 16kb block 
-
-		remainingBytes := work.Length - offset
-		weAreRequestingTooMuch := (offset + requestLength) > work.Length
-
-		if weAreRequestingTooMuch {
-			requestLength = remainingBytes
+		// loop through the piece after every 16kb
+		reqLen := BlockSize
+		if offset+reqLen > work.Length {
+			reqLen = work.Length - offset // this is to catch the last block, which might be smaller than 16kb
 		}
 
-		pieceIndex := work.Index
-
-		// build and send the request
-		payload := make([]byte, 12) // 3 fields * 4 bytes each
-		binary.BigEndian.PutUint32(payload[0:4], uint32(pieceIndex)) // put index as first 4 bytes 
+		// Send request
+		// The BitTorrent protocol requires a 12-byte request message with 3 fields packed in big-endian order — piece index, byte offset within the piece, and how many bytes you want.
+		payload := make([]byte, 12)
+		binary.BigEndian.PutUint32(payload[0:4], uint32(work.Index))
 		binary.BigEndian.PutUint32(payload[4:8], uint32(offset))
-		binary.BigEndian.PutUint32(payload[8:12], uint32(requestLength))
+		binary.BigEndian.PutUint32(payload[8:12], uint32(reqLen))
 
-		// send the request message
-		msg := &peer.Message{
-			ID: peer.MsgRequest,
-			Payload: payload,
-		}
-
-		_, err := conn.Write(msg.Serialize())
+		_, err := conn.Write((&peer.Message{ID: peer.MsgRequest, Payload: payload}).Serialize()) // wraps the payload in a Message struct with type MsgRequest and sends it over TCP connectiont to the peer.
 		if err != nil {
 			return nil, err
 		}
 
-		// Read until we get the piece we want
+		// Read response, starts an inner loop that keeps reading messages from the peer until i get the response block
 		for {
 			msg, err := peer.ReadMessage(conn)
 			if err != nil {
 				return nil, err
 			}
+
 			if msg.ID == peer.MsgPiece {
+				// we have found the response piece
 				if len(msg.Payload) < 8 {
 					continue
 				}
+
+				// MsgPiece response has a 12-byte header, first 4 bytes piece index, second 4 bytes block offset, remaining bytes is the actual response
 				index := int(binary.BigEndian.Uint32(msg.Payload[0:4]))
 				begin := int(binary.BigEndian.Uint32(msg.Payload[4:8]))
 				block := msg.Payload[8:]
 
-				// Check if this is the block we asked for
+				// this confirms that this is actually the response i requested for, if it is it copies it into the data and breaks out of the loop
 				if index == work.Index && begin == offset {
-					copy(buffer[begin:], block)
-					break // got what we wanted, move to next block
+					copy(data[begin:], block)
+					break
 				}
 			} else if msg.ID == peer.MsgChoke {
-				return nil, errors.New("peer choked us")
-			} else if msg.ID != 0 {
-				fmt.Printf("Ignored message ID %d\n", msg.ID)
+				// 
+				return nil, errors.New("peer choked")
 			}
 		}
 	}
-	return buffer, nil
+
+	return data, nil
 }
