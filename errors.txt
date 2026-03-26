@@ -13,3 +13,13 @@ When connecting to a peer, the BitTorrent protocol expects the peer to send a Bi
 But when I tested against a real peer, it sent an Unchoke message (ID=1) instead of a Bitfield (ID=5) and my client crashed. 
 Turns out some peers skip the Bitfield entirely if they have all pieces and go straight to Unchoke — implying "I have everything, just ask me." 
 The fix was to detect this case and create a full bitfield with all bits set to 1 (0xff), assuming the peer is a full seeder.
+
+The Challenge
+One of the biggest challenges encountered while building this BitTorrent client was handling peer connection stability during piece downloading. 
+After successfully completing the handshake and receiving an unchoke from the peer (in this case, Ubuntu’s official seed), the connection would consistently drop with an EOF error as soon as the client started sending Request messages. 
+This happened because most modern BitTorrent seeds expect pipelining — the client must send multiple block requests quickly without waiting for each response. 
+Sending requests one-by-one (the initial naive approach) caused the peer to lose patience and close the connection.
+What We Tried
+We first implemented a basic request-response loop (one block at a time), which led to immediate connection drops. 
+We then added pipelining by sending multiple requests ahead (increasing MaxPendingRequests from 5 to 8) while properly tracking pending responses. 
+We also fixed the doHandshakeFlow logic to correctly handle immediate unchoke messages from seeds and improved error handling throughout the download process.

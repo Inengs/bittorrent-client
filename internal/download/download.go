@@ -55,7 +55,7 @@ func Download(t torrent.TorrentFile, peers []peer.Peer, peerID [20]byte) ([]byte
 
 	// Start worker goroutines (limited to max 5 concurrent peers)
 	var wg sync.WaitGroup
-	maxWorkers := 5
+	maxWorkers := 2
 	if len(peers) < maxWorkers {
 		maxWorkers = len(peers) // if the last remaining peers is less than 5, just start them
 	}
@@ -116,7 +116,7 @@ func downloadFromPeer(p peer.Peer, peerID [20]byte, t torrent.TorrentFile, work 
 	// Opens a TCP connection to the peer and performs the initial BitTorrent handshake — exchanging InfoHash and peer IDs to confirm you're both talking about the same torrent.
 	conn, err := peer.Connect(p, t.InfoHash, peerID)
 	if err != nil {
-		return nil
+		return err
 	}
 
 	defer conn.Close() // Ensures the TCP connection is always closed when this function returns
@@ -151,11 +151,14 @@ func doHandshakeFlow(conn net.Conn) error {
 		return fmt.Errorf("failed to read first message: %w", err)
 	}
 
+	alreadyUnchoked := false
+
 	switch msg.ID {
 	case peer.MsgBitfield:
 		fmt.Println("Received bitfield") // means we have it complete
 	case peer.MsgUnchoke:
 		fmt.Println("Peer sent unchoke immediately (seed behavior)") // sometimes it just sends unchoke immediately
+		alreadyUnchoked = true   // ← This was missing!
 	default:
 		fmt.Printf("Received unexpected message ID: %d after handshake\n", msg.ID)
 	}
@@ -166,53 +169,72 @@ func doHandshakeFlow(conn net.Conn) error {
 		return err
 	}
 
-	// Wait for unchoke
-	for {
-		msg, err = peer.ReadMessage(conn)
-		if err != nil {
-			return err
-		}
+	// Only wait for unchoke if we didn't receive it already
+	if !alreadyUnchoked {
+		// Wait for unchoke
+		for {
+			msg, err = peer.ReadMessage(conn)
+			if err != nil {
+				return fmt.Errorf("failed waiting for unchoke: %w", err)
+			}
 
-		if msg.ID == peer.MsgUnchoke {
-			fmt.Println("Received unchoke - ready to download")
-			return nil
-		}
+			if msg.ID == peer.MsgUnchoke {
+				fmt.Println("Received unchoke - ready to download")
+				return nil
+			}
 
-		// Ignore keep-alives and other messages (like Have)
-		if msg.ID != 0 {
-			fmt.Printf("Ignored message ID %d while waiting for unchoke\n", msg.ID)
+			// Ignore keep-alives and other messages (like Have)
+			if msg.ID != 0 {
+				fmt.Printf("Ignored message ID %d while waiting for unchoke\n", msg.ID)
+			}
 		}
+	} else {
+		fmt.Println("Already unchoked - ready to download")
 	}
+
+	return nil
 }
 
 func downloadPiece(conn net.Conn, work PieceWork) ([]byte, error) {
 	// connects via TCP to a peer and a PieceWork(this carries the piece index, length and hash), it then returns the raw bytes or an error
 	data := make([]byte, work.Length) // create a buffer to store the downloaded block
+	const MaxPendingRequests = 10
 
-	for offset := 0; offset < work.Length; offset += BlockSize {
-		// loop through the piece after every 16kb
-		reqLen := BlockSize
-		if offset+reqLen > work.Length {
-			reqLen = work.Length - offset // this is to catch the last block, which might be smaller than 16kb
-		}
+	offset := 0; 
 
-		// Send request
-		// The BitTorrent protocol requires a 12-byte request message with 3 fields packed in big-endian order — piece index, byte offset within the piece, and how many bytes you want.
-		payload := make([]byte, 12)
-		binary.BigEndian.PutUint32(payload[0:4], uint32(work.Index))
-		binary.BigEndian.PutUint32(payload[4:8], uint32(offset))
-		binary.BigEndian.PutUint32(payload[8:12], uint32(reqLen))
+	for offset < work.Length {
+		// Step 1: Send up to MaxPendingRequests
+		pending := 0
 
-		_, err := conn.Write((&peer.Message{ID: peer.MsgRequest, Payload: payload}).Serialize()) // wraps the payload in a Message struct with type MsgRequest and sends it over TCP connectiont to the peer.
-		if err != nil {
-			return nil, err
+		for pending < MaxPendingRequests && offset < work.Length {
+			// loop through the piece after every 16kb
+			reqLen := BlockSize
+			if offset+reqLen > work.Length {
+				reqLen = work.Length - offset // this is to catch the last block, which might be smaller than 16kb
+			}
+
+			// Send request
+			// The BitTorrent protocol requires a 12-byte request message with 3 fields packed in big-endian order — piece index, byte offset within the piece, and how many bytes you want.
+			payload := make([]byte, 12)
+			binary.BigEndian.PutUint32(payload[0:4], uint32(work.Index))
+			binary.BigEndian.PutUint32(payload[4:8], uint32(offset))
+			binary.BigEndian.PutUint32(payload[8:12], uint32(reqLen))
+
+			_, err := conn.Write((&peer.Message{ID: peer.MsgRequest, Payload: payload}).Serialize()) // wraps the payload in a Message struct with type MsgRequest and sends it over TCP connectiont to the peer.
+			if err != nil {
+				return nil, fmt.Errorf("failed to send request: %w", err)
+			}
+
+			pending++
+			offset += reqLen
 		}
 
 		// Read response, starts an inner loop that keeps reading messages from the peer until i get the response block
-		for {
+		// Step 2: Read responses until all pending requests are fulfilled
+		for pending > 0 {
 			msg, err := peer.ReadMessage(conn)
 			if err != nil {
-				return nil, err
+				return nil, fmt.Errorf("failed to read message: %w", err)
 			}
 
 			if msg.ID == peer.MsgPiece {
@@ -227,10 +249,10 @@ func downloadPiece(conn net.Conn, work PieceWork) ([]byte, error) {
 				block := msg.Payload[8:]
 
 				// this confirms that this is actually the response i requested for, if it is it copies it into the data and breaks out of the loop
-				if index == work.Index && begin == offset {
+				if index == work.Index {
 					copy(data[begin:], block)
-					break
 				}
+				pending-- // one request fulfilled
 			} else if msg.ID == peer.MsgChoke {
 				// 
 				return nil, errors.New("peer choked")
